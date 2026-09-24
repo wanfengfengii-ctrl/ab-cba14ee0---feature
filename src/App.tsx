@@ -9,6 +9,7 @@ import {
   type Issue,
   type RawInputs,
 } from './solver/solver';
+import type { ProbePlan, ProbePoint, ProbeWitness } from './solver/probe';
 import { useUnwrap } from './useUnwrap';
 
 /* ---------------- 默认与示例 ---------------- */
@@ -76,6 +77,7 @@ function MatrixView(props: {
   values: number[];
   badge: number[];
   mark?: Set<number>;
+  probeMark?: Set<number>;
   anchorIndex?: number;
   title: string;
   caption?: string;
@@ -98,6 +100,7 @@ function MatrixView(props: {
               className={
                 'mv-cell' +
                 (props.mark?.has(i) ? ' mv-mark' : '') +
+                (props.probeMark?.has(i) ? ' mv-probe' : '') +
                 (props.anchorIndex === i ? ' mv-anchor' : '')
               }
               title={`第 ${r + 1} 行第 ${c + 1} 列`}
@@ -445,6 +448,7 @@ export default function App(props: { initial?: RawInputs }) {
           {evaluation?.status === 'ok' && (
             <ResultView
               result={evaluation.result}
+              probe={evaluation.probe}
               rows={raw.rows}
               cols={raw.cols}
               anchorIndex={anchorIndex}
@@ -460,16 +464,134 @@ export default function App(props: { initial?: RawInputs }) {
   );
 }
 
+/* ---------------- 补测计划展示 ---------------- */
+
+function coordText(index: number, cols: number): string {
+  return `（${Math.floor(index / cols) + 1}, ${(index % cols) + 1}）`;
+}
+
+/** 以行优先小矩阵展示圈数序列，差异单元加粗标红 */
+function CyclesGrid(props: { cycles: number[]; diff: Set<number>; cols: number }) {
+  return (
+    <span className="cycle-grid" role="img">
+      {props.cycles.map((k, i) => (
+        <span
+          key={i}
+          className={'cycle-cell' + (props.diff.has(i) ? ' cycle-diff' : '')}
+          title={`第 ${Math.floor(i / props.cols) + 1} 行第 ${(i % props.cols) + 1} 列`}
+        >
+          {k}
+          {(i + 1) % props.cols === 0 ? ';' : ''}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function witnessDiffSet(w: ProbeWitness): Set<number> {
+  return new Set(w.diffCells.map((d) => d.index));
+}
+
+function ProbePointRow(props: { point: ProbePoint; cols: number }) {
+  const { point, cols } = props;
+  return (
+    <li className="probe-point">
+      <span className="probe-coord">测点 {coordText(point.index, cols)}</span>
+      <span className="probe-expect">预期圈数 k = {point.expectedCycles}</span>
+      {point.redundant ? (
+        <span className="probe-note">冗余点：移除后其余测点仍能区分全部替代见证</span>
+      ) : (
+        <span className="probe-note">
+          移除后重现替代见证：
+          <CyclesGrid
+            cycles={point.reappear!.cycles}
+            diff={witnessDiffSet(point.reappear!)}
+            cols={cols}
+          />
+          <span className="probe-diff">
+            差异单元{' '}
+            {point.reappear!.diffCells.map((d) => coordText(d.index, cols)).join('、')}
+          </span>
+        </span>
+      )}
+    </li>
+  );
+}
+
+export function ProbePlanPanel(props: { plan: ProbePlan; cols: number }) {
+  const { plan, cols } = props;
+
+  if (plan.status === 'unique') {
+    return (
+      <div className="probe-panel probe-unique">
+        <h4>补测规划</h4>
+        <p className="ok-note">不存在同分替代圈数矩阵，结论已唯一，无需安排补测。</p>
+      </div>
+    );
+  }
+
+  if (plan.status === 'too-many') {
+    return (
+      <div className="probe-panel probe-bad">
+        <h4>补测规划</h4>
+        <p>
+          同分替代圈数矩阵已枚举到 <strong>{plan.alternativeCount}</strong> 个仍未穷尽
+          （枚举预算 {plan.budget}），候选范围过大，无法可靠给出补测集合。请收紧约束或调整输入后再规划。
+        </p>
+      </div>
+    );
+  }
+
+  const impossible = plan.status === 'impossible';
+  return (
+    <div className={'probe-panel' + (impossible ? ' probe-warn' : '')}>
+      <h4>补测规划（下一轮人工测量）</h4>
+      <p className="caption">
+        共 {plan.alternativeCount} 个同分替代圈数矩阵。下列计划在全部能区分这些见证的候选子集中
+        {impossible ? '覆盖替代矩阵数最多，且' : '测点数最少、'}按行优先坐标序列字典序最小；
+        每点预期测量真值取当前主见证圈数。
+      </p>
+      <ol className="probe-list">
+        {plan.points.map((pt) => (
+          <ProbePointRow key={pt.index} point={pt} cols={cols} />
+        ))}
+      </ol>
+      {impossible && (
+        <div className="probe-undistinguished">
+          <p>
+            即使安排 {plan.points.length} 个测点（上限 10 个）仍不能区分全部替代矩阵。
+            首个未被区分的圈数矩阵为：
+          </p>
+          <CyclesGrid
+            cycles={plan.firstUndistinguished.cycles}
+            diff={witnessDiffSet(plan.firstUndistinguished)}
+            cols={cols}
+          />
+          <p className="probe-diff">
+            与主见证的差异单元：
+            {plan.firstUndistinguished.diffCells.map((d) => coordText(d.index, cols)).join('、')}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---------------- 结果展示 ---------------- */
 
 function ResultView(props: {
   result: Extract<Evaluation, { status: 'ok' }>['result'];
+  probe: ProbePlan;
   rows: number;
   cols: number;
   anchorIndex: number;
 }) {
   const { result, rows, cols, anchorIndex } = props;
   const { primary, witness } = result;
+  const probeIndices =
+    props.probe.status === 'ready' || props.probe.status === 'impossible'
+      ? new Set(props.probe.points.map((p) => p.index))
+      : new Set<number>();
   return (
     <>
       <div className="objectives">
@@ -489,9 +611,12 @@ function ResultView(props: {
         cols={cols}
         values={primary.unwrapped}
         badge={primary.cycles}
+        probeMark={probeIndices}
         anchorIndex={anchorIndex}
-        caption="格内大字为 Φ = 读数 + k × P，下方徽标为该格裁决圈数 k。"
+        caption="格内大字为 Φ = 读数 + k × P，下方徽标为该格裁决圈数 k；紫框为建议补测单元。"
       />
+
+      <ProbePlanPanel plan={props.probe} cols={cols} />
 
       {witness ? (
         <details className="witness" open>

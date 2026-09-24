@@ -14,7 +14,13 @@
  * 实现：按行优先逐格赋值，前沿动态规划 + 双目标 Pareto 剪枝。
  * 列数 ≤ 4，前沿只需保留最近两行（共 2C 个圈数），状态域 ≤ 3^(2C) ≤ 3^8。
  * 并列的等优路径全部保留，最终按圈数序列字典序取最小与次小见证。
+ *
+ * 补测规划需要全部同分替代矩阵：以前向各层可行状态为骨架，再做一次反向
+ * Pareto 价值 DP，正向 DFS 仅沿“前缀代价 + 后缀价值 == 最优目标”的分支
+ * 枚举，撞上预算则安全中止（规划层据此拒绝给出不可靠计划）。
  */
+
+import { buildProbePlan, DEFAULT_ALTERNATIVE_BUDGET, type ProbePlan } from './probe';
 
 export const MIN_ROWS = 2;
 export const MAX_ROWS = 24;
@@ -87,7 +93,7 @@ export type SolveResult =
 export type Evaluation =
   | { status: 'invalid'; issues: Issue[] }
   | { status: 'unsat'; result: Extract<SolveResult, { status: 'unsat' }> }
-  | { status: 'ok'; result: Extract<SolveResult, { status: 'ok' }> };
+  | { status: 'ok'; result: Extract<SolveResult, { status: 'ok' }>; probe: ProbePlan };
 
 /** 严格解析十进制整数（允许前后空白与正负号），超界或非法返回 null */
 export function parseInteger(text: string): number | null {
@@ -326,21 +332,139 @@ function prune(recs: Rec[]): Rec[] {
 }
 
 export function solve(p: SolverParams): SolveResult {
-  const { rows: R, cols: C, readings: rd, period: P } = p;
-  const N = R * C;
+  const ran = runForward(p);
+  if (ran.kind === 'edge-unsat') {
+    return {
+      status: 'unsat',
+      message: '存在无论怎样选择圈数都无法满足相邻跳变上限的边，约束相互冲突',
+      edgeFailures: ran.edgeFailures,
+      failCell: null,
+    };
+  }
+  if (ran.kind === 'unsat') {
+    return {
+      status: 'unsat',
+      message:
+        '不存在同时满足锚点、圈数区间与相邻跳变上限的圈数分配（二阶/一阶目标尚无可行解）',
+      edgeFailures: [],
+      failCell: ran.failCell,
+    };
+  }
+  return choosePrimary(ran.terminals, p);
+}
+
+/* ---------------- 前向 DP 骨架（供求解与补测枚举共用） ---------------- */
+
+interface Cost {
+  o2: number;
+  o1: number;
+}
+
+/** 轻量前沿状态：最近两行的圈数（枚举只需结构与可达键集，不需记录链） */
+export interface State {
+  tb: number[];
+  ob: number[];
+  cur: number[];
+}
+
+/** 状态键（tb|ob|cur，行优先）解析回三个圈数数组；段长度由层位置决定 */
+export function parseStateKey(key: string): State {
+  const [t, o, u] = key.split('|');
+  const nums = (s: string): number[] => (s.length === 0 ? [] : s.split(',').map(Number));
+  return { tb: nums(t), ob: nums(o), cur: nums(u) };
+}
+
+interface ForwardOk {
+  kind: 'ok';
+  /** layers[i]：处理完行优先第 i 格后可达状态的键集合（结构可由键解析） */
+  layers: Set<string>[];
+  terminals: Rec[];
+  best: Cost;
+}
+type ForwardOutcome =
+  | { kind: 'edge-unsat'; edgeFailures: EdgeFailure[] }
+  | { kind: 'unsat'; failCell: { row: number; col: number } | null }
+  | ForwardOk;
+
+/** 在状态 (tb,ob,cur) 下给第 i 格赋圈数 k：边约束与新增的两项目标增量 */
+function stepCost(
+  p: SolverParams,
+  i: number,
+  k: number,
+  tb: number[],
+  ob: number[],
+  cur: number[],
+): Cost | null {
+  const { cols: C, readings: rd, period: P } = p;
+  const r = Math.floor(i / C);
+  const c = i % C;
   const limit = p.jumpCap * P;
-  const anchorIndex = p.anchorRow * C + p.anchorCol;
+  const leftK = c > 0 ? cur[c - 1] : null;
+  const upK = r > 0 ? ob[c] : null;
+  const tbK = r >= 2 ? tb[0] : null;
+
+  let o2 = 0;
+  let o1 = 0;
+
+  if (leftK !== null) {
+    const dNew = rd[i] - rd[i - 1] + (k - leftK) * P;
+    if (Math.abs(dNew) > limit) return null;
+    o1 += Math.abs(dNew);
+    if (c >= 2) {
+      const dPrev = rd[i - 1] - rd[i - 2] + (leftK - cur[c - 2]) * P;
+      o2 += Math.abs(dNew - dPrev);
+    }
+  }
+  if (upK !== null) {
+    const dNew = rd[i] - rd[i - C] + (k - upK) * P;
+    if (Math.abs(dNew) > limit) return null;
+    o1 += Math.abs(dNew);
+    if (r >= 2) {
+      const dPrev = rd[i - C] - rd[i - 2 * C] + (upK - (tbK as number)) * P;
+      o2 += Math.abs(dNew - dPrev);
+    }
+  }
+  return { o2, o1 };
+}
+
+/** 第 i 格赋值 k 后的新前沿状态 */
+function nextState(
+  tb: number[],
+  ob: number[],
+  cur: number[],
+  k: number,
+  row: number,
+  col: number,
+  cols: number,
+): { tb: number[]; ob: number[]; cur: number[] } {
+  if (col + 1 < cols) {
+    return {
+      tb: row >= 2 ? tb.slice(1) : [],
+      ob,
+      cur: [...cur, k],
+    };
+  }
+  // 换行：上一行成为 tb（若下下行需要），当前行成为 ob
+  return { tb: ob, ob: [...cur, k], cur: [] };
+}
+
+function runForward(p: SolverParams): ForwardOutcome {
+  const { rows: R, cols: C } = p;
+  const N = R * C;
 
   const domain: number[][] = new Array(N);
   for (let i = 0; i < N; i++) {
     domain[i] =
-      i === anchorIndex
+      i === p.anchorRow * C + p.anchorCol
         ? [p.anchorCycles]
         : Array.from({ length: p.cycleMax - p.cycleMin + 1 }, (_, d) => p.cycleMin + d);
   }
 
   // 单边固有可行性预检：任一相邻对在各自圈数域内都无法满足跳变上限 → 定位该边
   const edgeFailures: EdgeFailure[] = [];
+  const rd = p.readings;
+  const P = p.period;
+  const limit = p.jumpCap * P;
   const pairFeasible = (i: number, j: number): boolean => {
     for (const ki of domain[i]) {
       for (const kj of domain[j]) {
@@ -360,84 +484,42 @@ export function solve(p: SolverParams): SolveResult {
       }
     }
   }
-  if (edgeFailures.length > 0) {
-    return {
-      status: 'unsat',
-      message: '存在无论怎样选择圈数都无法满足相邻跳变上限的边，约束相互冲突',
-      edgeFailures,
-      failCell: null,
-    };
-  }
+  if (edgeFailures.length > 0) return { kind: 'edge-unsat', edgeFailures };
 
-  const initial: Node = { tb: [], ob: [], cur: [], recs: [{ o2: 0, o1: 0, k: -1, parent: null }] };
+  const initial: Node = {
+    tb: [],
+    ob: [],
+    cur: [],
+    recs: [{ o2: 0, o1: 0, k: -1, parent: null }],
+  };
   let frontier = new Map<string, Node>([[nodeKey([], [], []), initial]]);
+  // 只把每层可达状态的键留下（结构可解析）：完整 Rec 与圈数数组不跨层存活
+  const layers: Set<string>[] = [];
   let failCell: { row: number; col: number } | null = null;
 
   for (let r = 0; r < R; r++) {
     for (let c = 0; c < C; c++) {
       const i = r * C + c;
       const next = new Map<string, Node>();
+      const stateKeys = new Set<string>();
 
       for (const node of frontier.values()) {
-        const leftK = c > 0 ? node.cur[c - 1] : null;
-        const upK = r > 0 ? node.ob[c] : null;
-        const tbK = r >= 2 ? node.tb[0] : null;
-
         for (const k of domain[i]) {
-          let o2add = 0;
-          let o1add = 0;
-          let feasible = true;
+          const add = stepCost(p, i, k, node.tb, node.ob, node.cur);
+          if (!add) continue;
 
-          if (leftK !== null) {
-            const dNew = rd[i] - rd[i - 1] + (k - leftK) * P;
-            if (Math.abs(dNew) > limit) {
-              feasible = false;
-            } else {
-              o1add += Math.abs(dNew);
-              if (c >= 2) {
-                const dPrev = rd[i - 1] - rd[i - 2] + (leftK - node.cur[c - 2]) * P;
-                o2add += Math.abs(dNew - dPrev);
-              }
-            }
-          }
-          if (feasible && upK !== null) {
-            const dNew = rd[i] - rd[i - C] + (k - upK) * P;
-            if (Math.abs(dNew) > limit) {
-              feasible = false;
-            } else {
-              o1add += Math.abs(dNew);
-              if (r >= 2) {
-                const dPrev = rd[i - C] - rd[i - 2 * C] + (upK - (tbK as number)) * P;
-                o2add += Math.abs(dNew - dPrev);
-              }
-            }
-          }
-          if (!feasible) continue;
-
-          let ntb: number[];
-          let nob: number[];
-          let ncur: number[];
-          if (c + 1 < C) {
-            ntb = r >= 2 ? node.tb.slice(1) : [];
-            nob = node.ob;
-            ncur = [...node.cur, k];
-          } else {
-            // 换行：上一行成为 tb（若下下行需要），当前行成为 ob
-            ntb = node.ob;
-            nob = [...node.cur, k];
-            ncur = [];
-          }
-
-          const key = nodeKey(ntb, nob, ncur);
+          const ns = nextState(node.tb, node.ob, node.cur, k, r, c, C);
+          const key = nodeKey(ns.tb, ns.ob, ns.cur);
           let bucket = next.get(key);
           if (!bucket) {
-            bucket = { tb: ntb, ob: nob, cur: ncur, recs: [] };
+            bucket = { tb: ns.tb, ob: ns.ob, cur: ns.cur, recs: [] };
             next.set(key, bucket);
+            stateKeys.add(key);
           }
           for (const parent of node.recs) {
             bucket.recs.push({
-              o2: parent.o2 + o2add,
-              o1: parent.o1 + o1add,
+              o2: parent.o2 + add.o2,
+              o1: parent.o1 + add.o1,
               k,
               parent,
             });
@@ -452,30 +534,33 @@ export function solve(p: SolverParams): SolveResult {
       }
       for (const node of next.values()) node.recs = prune(node.recs);
       frontier = next;
+      layers[i] = stateKeys;
     }
     if (frontier.size === 0) break;
   }
 
-  if (frontier.size === 0) {
-    return {
-      status: 'unsat',
-      message:
-        '不存在同时满足锚点、圈数区间与相邻跳变上限的圈数分配（二阶/一阶目标尚无可行解）',
-      edgeFailures: [],
-      failCell,
-    };
-  }
+  if (frontier.size === 0) return { kind: 'unsat', failCell };
 
-  // 终点唯一（空前沿），其中保留全局 Pareto 最优路径
   const terminals: Rec[] = [];
   for (const node of frontier.values()) terminals.push(...node.recs);
-  let best: Rec | null = null;
+  let best: Rec = terminals[0];
   for (const rec of terminals) {
-    if (!best || rec.o2 < best.o2 || (rec.o2 === best.o2 && rec.o1 < best.o1)) best = rec;
+    if (rec.o2 < best.o2 || (rec.o2 === best.o2 && rec.o1 < best.o1)) best = rec;
   }
-  const bestPair = terminals.filter(
-    (rec) => rec.o2 === best!.o2 && rec.o1 === best!.o1,
-  );
+  return { kind: 'ok', layers, terminals, best: { o2: best.o2, o1: best.o1 } };
+}
+
+/** 终点记录中按目标值与行优先字典序选出主见证与第二小见证 */
+function choosePrimary(terminals: Rec[], p: SolverParams): Extract<SolveResult, { status: 'ok' }> {
+  const N = p.rows * p.cols;
+  const rd = p.readings;
+  const P = p.period;
+
+  let best: Rec = terminals[0];
+  for (const rec of terminals) {
+    if (rec.o2 < best.o2 || (rec.o2 === best.o2 && rec.o1 < best.o1)) best = rec;
+  }
+  const bestPair = terminals.filter((rec) => rec.o2 === best.o2 && rec.o1 === best.o1);
 
   const rebuild = (rec: Rec): number[] => {
     const cycles = new Array<number>(N);
@@ -518,12 +603,175 @@ export function solve(p: SolverParams): SolveResult {
   };
 }
 
-/** 页面与测试共用的总入口：校验 → 求解 */
+/* -------- 全部同分替代矩阵枚举：精确目标可达性记忆化 + 正向最优 DFS -------- */
+
+/**
+ * 枚举达到最优目标值 (best) 的全部圈数矩阵，按行优先字典序升序产出；
+ * 最多收集 limit 个，撞限则 truncated=true（实际数量的下界）。
+ *
+ * 可达性按需记忆化：canFinish(i,key,b2,b1) 表示从“处理第 i 格前”的状态
+ * 出发，是否存在后缀恰好补齐剩余的 (曲率,总变差) 预算；单步增量超预算即剪枝，
+ * 避免为每个沿途状态计算完整 Pareto 后缀表。
+ */
+function enumerateAlternatives(
+  p: SolverParams,
+  layers: Set<string>[],
+  best: Cost,
+  limit: number,
+): { solutions: number[][]; truncated: boolean } {
+  const { rows: R, cols: C } = p;
+  const N = R * C;
+  const domain: number[][] = new Array(N);
+  for (let i = 0; i < N; i++) {
+    domain[i] =
+      i === p.anchorRow * C + p.anchorCol
+        ? [p.anchorCycles]
+        : Array.from({ length: p.cycleMax - p.cycleMin + 1 }, (_, d) => p.cycleMin + d);
+  }
+
+  const emptyState: State = { tb: [], ob: [], cur: [] };
+  const parsed = new Map<string, State>();
+  const stateBefore = (i: number, key: string): State => {
+    if (i === 0) return emptyState;
+    let s = parsed.get(key);
+    if (!s) {
+      s = parseStateKey(key);
+      parsed.set(key, s);
+    }
+    return s;
+  };
+
+  const canMemo = new Map<string, boolean>();
+  const canFinish = (i: number, key: string, b2: number, b1: number): boolean => {
+    if (b2 < 0 || b1 < 0) return false;
+    if (i === N) return b2 === 0 && b1 === 0;
+    const mk = i + '|' + key + '|' + b2 + '|' + b1;
+    const cached = canMemo.get(mk);
+    if (cached !== undefined) return cached;
+
+    const node = stateBefore(i, key);
+    const r = Math.floor(i / C);
+    const c = i % C;
+    let out = false;
+    for (const k of domain[i]) {
+      const add = stepCost(p, i, k, node.tb, node.ob, node.cur);
+      if (!add || add.o2 > b2 || add.o1 > b1) continue;
+      const ns = nextState(node.tb, node.ob, node.cur, k, r, c, C);
+      const nsKey = nodeKey(ns.tb, ns.ob, ns.cur);
+      if (!layers[i].has(nsKey)) continue; // 无前向可行前缀
+      if (canFinish(i + 1, nsKey, b2 - add.o2, b1 - add.o1)) {
+        out = true;
+        break;
+      }
+    }
+    canMemo.set(mk, out);
+    return out;
+  };
+
+  const solutions: number[][] = [];
+  const assign = new Array<number>(N);
+  let truncated = false;
+
+  const dfs = (i: number, stateKey: string, acc: Cost): void => {
+    if (truncated) return;
+    if (i === N) {
+      if (acc.o2 === best.o2 && acc.o1 === best.o1) {
+        solutions.push(assign.slice());
+        if (solutions.length >= limit) truncated = true;
+      }
+      return;
+    }
+    const node = stateBefore(i, stateKey);
+    const r = Math.floor(i / C);
+    const c = i % C;
+    for (const k of domain[i]) {
+      const add = stepCost(p, i, k, node.tb, node.ob, node.cur);
+      if (!add) continue;
+      const a2 = acc.o2 + add.o2;
+      const a1 = acc.o1 + add.o1;
+      if (a2 > best.o2 || a1 > best.o1) continue;
+      const ns = nextState(node.tb, node.ob, node.cur, k, r, c, C);
+      const nsKey = nodeKey(ns.tb, ns.ob, ns.cur);
+      if (!layers[i].has(nsKey)) continue;
+      if (!canFinish(i + 1, nsKey, best.o2 - a2, best.o1 - a1)) continue;
+      assign[i] = k;
+      dfs(i + 1, nsKey, { o2: a2, o1: a1 });
+      if (truncated) return;
+    }
+  };
+
+  dfs(0, nodeKey([], [], []), { o2: 0, o1: 0 });
+  return { solutions, truncated };
+}
+
+/** 求解并枚举同分替代矩阵（补测规划使用） */
+export function solveWithAlternatives(
+  p: SolverParams,
+  enumLimit: number = DEFAULT_ALTERNATIVE_BUDGET + 1,
+):
+  | { status: 'unsat'; result: Extract<SolveResult, { status: 'unsat' }> }
+  | {
+      status: 'ok';
+      result: Extract<SolveResult, { status: 'ok' }>;
+      /** 不含主见证的同分替代矩阵，行优先字典序升序 */
+      alternatives: number[][];
+      truncated: boolean;
+    } {
+  const ran = runForward(p);
+  if (ran.kind === 'edge-unsat') {
+    return {
+      status: 'unsat',
+      result: {
+        status: 'unsat',
+        message: '存在无论怎样选择圈数都无法满足相邻跳变上限的边，约束相互冲突',
+        edgeFailures: ran.edgeFailures,
+        failCell: null,
+      },
+    };
+  }
+  if (ran.kind === 'unsat') {
+    return {
+      status: 'unsat',
+      result: {
+        status: 'unsat',
+        message:
+          '不存在同时满足锚点、圈数区间与相邻跳变上限的圈数分配（二阶/一阶目标尚无可行解）',
+        edgeFailures: [],
+        failCell: ran.failCell,
+      },
+    };
+  }
+  const result = choosePrimary(ran.terminals, p);
+  // 前向剪枝保证：无第二小字典序见证即全局同分序列唯一，无需再做全枚举。
+  // 主见证已重建为普通圈数数组，清空记录根，整条 Rec 链即可回收。
+  ran.terminals.length = 0;
+  if (result.witness === null) {
+    return { status: 'ok', result, alternatives: [], truncated: false };
+  }
+  const { solutions, truncated } = enumerateAlternatives(p, ran.layers, ran.best, enumLimit);
+  // 枚举首个解必为字典序最小的主见证；剔除它后作为替代矩阵
+  const primaryKey = result.primary.cycles.join(',');
+  const alternatives = solutions.filter((s) => s.join(',') !== primaryKey);
+  return { status: 'ok', result, alternatives, truncated };
+}
+
+/** 页面与测试共用的总入口：校验 → 求解 → 补测规划 */
 export function evaluate(raw: RawInputs): Evaluation {
   const checked = validate(raw);
   if ('issues' in checked) return { status: 'invalid', issues: checked.issues };
-  const result = solve(checked.params);
-  return result.status === 'ok'
-    ? { status: 'ok', result }
-    : { status: 'unsat', result };
+  const ran = solveWithAlternatives(checked.params);
+  if (ran.status === 'unsat') return { status: 'unsat', result: ran.result };
+  const anchorIndex =
+    checked.params.anchorRow * checked.params.cols + checked.params.anchorCol;
+  // 撞枚举预算时把替代列表截到预算长度，规划层据此拒绝给出不可靠计划
+  const alternatives = ran.truncated
+    ? ran.alternatives.slice(0, DEFAULT_ALTERNATIVE_BUDGET)
+    : ran.alternatives;
+  const probe = buildProbePlan(
+    ran.result.primary.cycles,
+    alternatives,
+    anchorIndex,
+    checked.params.cols,
+  );
+  return { status: 'ok', result: ran.result, probe };
 }

@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
-import App from './App';
+import App, { ProbePlanPanel } from './App';
+import type { ProbePlan } from './solver/probe';
 import type { RawInputs } from './solver/solver';
 
 const make = (over: Partial<RawInputs> = {}): RawInputs => ({
@@ -72,6 +73,58 @@ describe('App 主界面', () => {
     render(<App initial={make()} />);
     expect(screen.queryByText('第二小字典序见证')).toBeNull();
     expect(screen.getByText(/两项目标最优值下圈数序列唯一/)).toBeTruthy();
+  });
+
+  it('唯一最优时补测规划明确无需补测', () => {
+    render(<App initial={make()} />);
+    expect(screen.getByText('补测规划')).toBeTruthy();
+    expect(screen.getByText(/不存在同分替代圈数矩阵，结论已唯一，无需安排补测/)).toBeTruthy();
+    expect(screen.queryByText('补测规划（下一轮人工测量）')).toBeNull();
+  });
+
+  it('并列时给出补测计划：测点、预期圈数与移除后重现的见证', () => {
+    render(
+      <App
+        initial={make({
+          cells: ['3', '2', '1', '4'],
+          period: '5',
+          cycleMin: '0',
+          cycleMax: '1',
+          jumpCap: '1',
+        })}
+      />,
+    );
+    expect(screen.getByText('补测规划（下一轮人工测量）')).toBeTruthy();
+    // 计划为测点（1,2）冗余点 +（2,1）核心点
+    const points = screen.getAllByText(/^测点/);
+    expect(points.length).toBe(2);
+    expect(screen.getByText('测点 （1, 2）')).toBeTruthy();
+    expect(screen.getByText('测点 （2, 1）')).toBeTruthy();
+    expect(screen.getAllByText('预期圈数 k = 0').length).toBe(2);
+    expect(screen.getByText(/冗余点：移除后其余测点仍能区分全部替代见证/)).toBeTruthy();
+    // 移除核心点（2,1）后唯一替代见证 [0,0,1,0] 重现，差异单元（2,1）
+    expect(screen.getAllByText(/移除后重现替代见证/).length).toBe(1);
+    expect(screen.getByText(/差异单元 （2, 1）/)).toBeTruthy();
+    // 主矩阵上两个测点被标记（紫框）
+    expect(document.querySelectorAll('.mv-probe').length).toBe(2);
+  });
+
+  it('输入变化立即撤下旧补测计划', () => {
+    render(
+      <App
+        initial={make({
+          cells: ['3', '2', '1', '4'],
+          period: '5',
+          cycleMin: '0',
+          cycleMax: '1',
+          jumpCap: '1',
+        })}
+      />,
+    );
+    expect(screen.getByText('补测规划（下一轮人工测量）')).toBeTruthy();
+    fireEvent.change(cellInput(1, 1), { target: { value: '' } });
+    expect(screen.queryByText('补测规划（下一轮人工测量）')).toBeNull();
+    expect(screen.queryByText('补测规划')).toBeNull();
   });
 
   it('非法参数与非法单元给出定位反馈', () => {
@@ -203,5 +256,52 @@ describe('App 主界面', () => {
     fireEvent.change(kInput, { target: { value: '1' } });
     // 锚点格真值 = 0 + 1*10 = 10，矩阵中应出现 10
     expect(screen.getAllByText('10').length).toBeGreaterThan(0);
+  });
+});
+
+describe('ProbePlanPanel 补测面板', () => {
+  it('unique：文案明确无需补测', () => {
+    render(<ProbePlanPanel plan={{ status: 'unique' }} cols={2} />);
+    expect(screen.getByText(/不存在同分替代圈数矩阵，结论已唯一/)).toBeTruthy();
+  });
+
+  it('too-many：说明枚举未穷尽且不给计划', () => {
+    const plan: ProbePlan = {
+      status: 'too-many',
+      alternativeCount: 200,
+      budget: 200,
+    };
+    const { container } = render(<ProbePlanPanel plan={plan} cols={4} />);
+    expect(container.textContent).toContain('同分替代圈数矩阵已枚举到 200 个仍未穷尽');
+    expect(screen.queryAllByText(/^测点/).length).toBe(0);
+  });
+
+  it('impossible：展示努力计划与首个未分辨矩阵及差异单元', () => {
+    const plan: ProbePlan = {
+      status: 'impossible',
+      alternativeCount: 11,
+      points: [
+        {
+          index: 0,
+          row: 0,
+          col: 0,
+          expectedCycles: 0,
+          redundant: false,
+          reappear: {
+            cycles: [1, 0, 0, 0],
+            diffCells: [{ index: 0, row: 0, col: 0 }],
+          },
+        },
+      ],
+      firstUndistinguished: {
+        cycles: [0, 1, 0, 0],
+        diffCells: [{ index: 1, row: 0, col: 1 }],
+      },
+    };
+    render(<ProbePlanPanel plan={plan} cols={2} />);
+    expect(screen.getByText(/仍不能区分全部替代矩阵/)).toBeTruthy();
+    expect(screen.getByText(/首个未被区分的圈数矩阵为/)).toBeTruthy();
+    expect(screen.getByText(/与主见证的差异单元：/)).toBeTruthy();
+    expect(screen.getByText('测点 （1, 1）')).toBeTruthy();
   });
 });
