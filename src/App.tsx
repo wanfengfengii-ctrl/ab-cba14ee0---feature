@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   parseMatrixText,
   MAX_COLS,
@@ -8,7 +8,13 @@ import {
   type Evaluation,
   type Issue,
   type RawInputs,
+  type TiedInfo,
 } from './solver/solver';
+import {
+  MAX_PLAN_POINTS,
+  MIN_PLAN_POINTS,
+  planRemeasure,
+} from './solver/remeasure';
 import { useUnwrap } from './useUnwrap';
 
 /* ---------------- 默认与示例 ---------------- */
@@ -45,6 +51,8 @@ const RAMP: RawInputs = {
 };
 
 /* ---------------- 小部件 ---------------- */
+
+const EMPTY_SET: Set<number> = new Set();
 
 function NumberField(props: {
   label: string;
@@ -121,6 +129,29 @@ export default function App(props: { initial?: RawInputs }) {
   const [raw, setRaw] = useState<RawInputs>(props.initial ?? DEFAULT);
   const [importText, setImportText] = useState('');
   const [importError, setImportError] = useState<{ message: string; row?: number; col?: number } | null>(null);
+
+  /*
+   * 补测候选范围（可触达单元）。选择随所属输入一起记录：
+   * 原始输入一旦变化（patch 必产生新对象），旧候选与旧计划立即失效撤下，
+   * 计量员需针对新输入重新选定候选范围。
+   */
+  const [selection, setSelection] = useState<{ owner: RawInputs; cells: Set<number> }>({
+    owner: raw,
+    cells: new Set(),
+  });
+  const selectedCells = selection.owner === raw ? selection.cells : EMPTY_SET;
+  const toggleCandidate = (i: number) => {
+    const next = new Set(selectedCells);
+    if (next.has(i)) {
+      next.delete(i);
+    } else {
+      if (next.size >= MAX_PLAN_POINTS) return;
+      next.add(i);
+    }
+    setSelection({ owner: raw, cells: next });
+  };
+  const setCandidates = (cells: number[]) =>
+    setSelection({ owner: raw, cells: new Set(cells) });
 
   const patch = (p: Partial<RawInputs>) => setRaw((s) => ({ ...s, ...p }));
 
@@ -445,9 +476,13 @@ export default function App(props: { initial?: RawInputs }) {
           {evaluation?.status === 'ok' && (
             <ResultView
               result={evaluation.result}
+              tied={evaluation.tied}
               rows={raw.rows}
               cols={raw.cols}
               anchorIndex={anchorIndex}
+              selectedCells={selectedCells}
+              onToggleCandidate={toggleCandidate}
+              onSetCandidates={setCandidates}
             />
           )}
         </section>
@@ -464,9 +499,13 @@ export default function App(props: { initial?: RawInputs }) {
 
 function ResultView(props: {
   result: Extract<Evaluation, { status: 'ok' }>['result'];
+  tied: TiedInfo;
   rows: number;
   cols: number;
   anchorIndex: number;
+  selectedCells: Set<number>;
+  onToggleCandidate: (i: number) => void;
+  onSetCandidates: (cells: number[]) => void;
 }) {
   const { result, rows, cols, anchorIndex } = props;
   const { primary, witness } = result;
@@ -521,7 +560,264 @@ function ResultView(props: {
       ) : (
         <p className="ok-note">两项目标最优值下圈数序列唯一，无并列见证。</p>
       )}
+
+      <RemeasurePanel
+        primary={primary.cycles}
+        tied={props.tied}
+        hasWitness={witness !== null}
+        rows={rows}
+        cols={cols}
+        selectedCells={props.selectedCells}
+        onToggleCandidate={props.onToggleCandidate}
+        onSetCandidates={props.onSetCandidates}
+      />
     </>
+  );
+}
+
+/* ---------------- 补测规划 ---------------- */
+
+/** 紧凑圈数矩阵：仅展示逐格圈数，可标红指定单元 */
+function CyclesGrid(props: {
+  cycles: number[];
+  rows: number;
+  cols: number;
+  mark?: Set<number>;
+  title: string;
+  caption?: string;
+}) {
+  const { rows, cols } = props;
+  return (
+    <div className="result-block">
+      <h4>{props.title}</h4>
+      {props.caption && <p className="caption">{props.caption}</p>}
+      <div
+        className="matrix-view"
+        style={{ gridTemplateColumns: `repeat(${cols}, minmax(64px, 1fr))` }}
+      >
+        {Array.from({ length: rows * cols }, (_, i) => {
+          const r = Math.floor(i / cols);
+          const c = i % cols;
+          return (
+            <div
+              key={i}
+              className={'mv-cell' + (props.mark?.has(i) ? ' mv-mark' : '')}
+              title={`第 ${r + 1} 行第 ${c + 1} 列`}
+            >
+              <span className="mv-coord">
+                {r + 1},{c + 1}
+              </span>
+              <span className="mv-value">{props.cycles[i]}</span>
+              <span className="mv-badge">k = {props.cycles[i]}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function RemeasurePanel(props: {
+  primary: number[];
+  tied: TiedInfo;
+  hasWitness: boolean;
+  rows: number;
+  cols: number;
+  selectedCells: Set<number>;
+  onToggleCandidate: (i: number) => void;
+  onSetCandidates: (cells: number[]) => void;
+}) {
+  const { primary, tied, hasWitness, rows, cols, selectedCells } = props;
+
+  // 主见证之外的全部同分替代矩阵（tied.matrices 已按行优先字典序升序，首项即主见证）
+  const alternatives = useMemo(
+    () => (tied.truncated ? [] : tied.matrices.slice(1)),
+    [tied],
+  );
+
+  // 替代矩阵相对主见证的差异单元并集（用于在候选网格中提示“争议”位置）
+  const diffUnion = useMemo(() => {
+    const set = new Set<number>();
+    for (const m of alternatives) {
+      for (let i = 0; i < primary.length; i++) if (m[i] !== primary[i]) set.add(i);
+    }
+    return set;
+  }, [alternatives, primary]);
+
+  /* 计划完全由当前主见证、替代矩阵集合与候选范围推导：
+     原始输入或候选范围一变，旧计划立即被新推导取代（输入变化时整个结果区已先行撤下）。 */
+  const plan = useMemo(
+    () => planRemeasure(primary, alternatives, [...selectedCells], cols),
+    [primary, alternatives, selectedCells, cols],
+  );
+
+  const pickDiffCells = () => props.onSetCandidates([...diffUnion].slice(0, MAX_PLAN_POINTS));
+
+  return (
+    <div className="remeasure">
+      <h3>补测规划</h3>
+
+      {!hasWitness && (
+        <p className="ok-note" data-testid="remeasure-unique">
+          当前结论唯一：不存在同等曲率与总变差的替代圈数矩阵，无需补测。
+        </p>
+      )}
+
+      {hasWitness && tied.truncated && (
+        <div className="panel panel-bad">
+          <h3>替代矩阵过多</h3>
+          <p className="sub">
+            同等曲率与总变差的替代圈数矩阵数量超出可完整枚举的上限，无法保证完整比较，
+            本轮暂不生成补测计划；请收紧圈数区间或相邻跳变上限后再试。
+          </p>
+        </div>
+      )}
+
+      {hasWitness && !tied.truncated && (
+        <>
+          <p className="caption">
+            除主见证外仍有 <strong>{alternatives.length}</strong> 个同等曲率与总变差的替代圈数矩阵
+            （按行优先字典序编号：替代 #1 即上方第二小字典序见证）。点击下方单元选定{' '}
+            {MIN_PLAN_POINTS}–{MAX_PLAN_POINTS} 个可触达单元作为候选范围，
+            系统将在其中完整比较全部子集，给出测点最少、行优先坐标字典序最小的补测计划；
+            每个测点的测量真值取主见证圈数。
+          </p>
+
+          <div
+            className="cand-grid"
+            style={{ gridTemplateColumns: `repeat(${cols}, minmax(64px, 1fr))` }}
+          >
+            {Array.from({ length: rows * cols }, (_, i) => {
+              const r = Math.floor(i / cols);
+              const c = i % cols;
+              const selected = selectedCells.has(i);
+              const inPlan =
+                plan.status === 'planned' && plan.points.some((pt) => pt.index === i);
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  aria-label={`候选单元 ${r + 1}-${c + 1}`}
+                  aria-pressed={selected}
+                  className={
+                    'cand-cell' +
+                    (selected ? ' on' : '') +
+                    (inPlan ? ' in-plan' : '') +
+                    (diffUnion.has(i) ? ' has-diff' : '')
+                  }
+                  title={
+                    `第 ${r + 1} 行第 ${c + 1} 列 · 主见证圈数 k=${primary[i]}` +
+                    (diffUnion.has(i) ? ' · 替代矩阵在此存在分歧' : '')
+                  }
+                  onClick={() => props.onToggleCandidate(i)}
+                >
+                  <span className="cand-coord">
+                    {r + 1},{c + 1}
+                  </span>
+                  <span className="cand-k">k={primary[i]}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="row-controls">
+            <span className="hint">
+              已选 {selectedCells.size} / {MAX_PLAN_POINTS} 个候选单元（至少 {MIN_PLAN_POINTS} 个）
+            </span>
+            <div className="spacer" />
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={diffUnion.size === 0}
+              onClick={pickDiffCells}
+              title={
+                diffUnion.size > MAX_PLAN_POINTS
+                  ? `差异单元共 ${diffUnion.size} 个，先选前 ${MAX_PLAN_POINTS} 个`
+                  : '选中全部存在分歧的单元'
+              }
+            >
+              选中差异单元
+            </button>
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={selectedCells.size === 0}
+              onClick={() => props.onSetCandidates([])}
+            >
+              清空
+            </button>
+          </div>
+
+          {plan.status === 'need-candidates' && (
+            <p className="hint" data-testid="remeasure-need">
+              请至少选定 {MIN_PLAN_POINTS} 个候选单元（当前 {plan.count} 个），系统随即生成补测计划。
+            </p>
+          )}
+
+          {plan.status === 'too-many-candidates' && (
+            <p className="err-text">
+              候选单元已达 {plan.count} 个，超过上限 {MAX_PLAN_POINTS} 个，请精简后再生成计划。
+            </p>
+          )}
+
+          {plan.status === 'no-plan' && (
+            <div className="panel panel-bad">
+              <h3>候选范围内无有效计划</h3>
+              <p className="sub">
+                在 {MIN_PLAN_POINTS}–{MAX_PLAN_POINTS} 个测点的限制内，候选范围的任何子集都无法
+                区分全部替代矩阵，请调整候选范围。
+              </p>
+            </div>
+          )}
+
+          {plan.status === 'indistinguishable' && (
+            <div className="panel panel-bad" data-testid="remeasure-indistinguishable">
+              <h3>候选范围不能区分全部替代解</h3>
+              <p className="sub">
+                首个未被区分的圈数矩阵（替代 #{plan.altIndex + 1}）在所有候选单元上都与主见证一致，
+                无论怎样取舍候选子集都无法排除它。差异单元：
+                {plan.diffCells
+                  .map((i) => `（${Math.floor(i / cols) + 1}, ${(i % cols) + 1}）`)
+                  .join('、')}
+                —— 均不在候选范围内，请调整候选范围后重试。
+              </p>
+              <CyclesGrid
+                title={`替代 #${plan.altIndex + 1} 的圈数矩阵（红框为与主见证的差异单元）`}
+                cycles={plan.matrix}
+                rows={rows}
+                cols={cols}
+                mark={new Set(plan.diffCells)}
+              />
+            </div>
+          )}
+
+          {plan.status === 'planned' && (
+            <div className="panel panel-plan" data-testid="remeasure-planned">
+              <h3>
+                补测计划：{plan.points.length} 个测点即可区分全部 {plan.alternativeCount} 个替代矩阵
+              </h3>
+              <p className="sub">
+                已完整比较候选范围的全部子集，此为测点最少、行优先坐标字典序最小的计划；
+                各测点实测圈数若与预期一致，全部替代矩阵即被排除。
+              </p>
+              <ul className="plan-points">
+                {plan.points.map((pt) => (
+                  <li key={pt.index}>
+                    <strong>
+                      测点（{pt.row + 1}, {pt.col + 1}）
+                    </strong>
+                    ：预期圈数 k = {pt.expected}；移除该点后重新出现的替代见证：
+                    {pt.reappearing.length > 0
+                      ? pt.reappearing.map((a) => `#${a + 1}`).join('、')
+                      : '无（该点为冗余测点，移除后计划仍有效）'}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

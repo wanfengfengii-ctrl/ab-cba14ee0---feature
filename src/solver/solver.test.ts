@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  enumerateTied,
   evaluate,
   parseInteger,
   parseMatrixText,
@@ -430,6 +431,117 @@ describe('solve 与暴力枚举一致（更大尺寸/全域三值）', () => {
       }
     });
   }
+});
+
+/* ---------------- 同分替代矩阵完整枚举（补测规划的数据基础） ---------------- */
+
+describe('enumerateTied 与暴力枚举一致', () => {
+  const cases: { seed: number; R: number; C: number }[] = [
+    { seed: 1, R: 2, C: 2 },
+    { seed: 7, R: 2, C: 3 },
+    { seed: 42, R: 3, C: 2 },
+    { seed: 99, R: 3, C: 3 },
+    { seed: 123, R: 2, C: 2 },
+    { seed: 777, R: 3, C: 3 },
+    { seed: 31, R: 2, C: 4 },
+    { seed: 88, R: 4, C: 2 },
+    { seed: 314, R: 3, C: 3 },
+    { seed: 2024, R: 4, C: 3 },
+  ];
+  for (const { seed, R, C } of cases) {
+    const rand = mulberry32(seed * 7 + 1);
+    const P = 1 + Math.floor(rand() * 4);
+    const cells = Array.from({ length: R * C }, () => String(Math.floor(rand() * (P + 2)) - 1));
+    const cmin = -1;
+    const cmax = 1;
+    const cap = Math.floor(rand() * 3);
+    const ar = Math.floor(rand() * R);
+    const ac = Math.floor(rand() * C);
+    const anchorK = cmin + Math.floor(rand() * (cmax - cmin + 1));
+
+    const p = paramsFrom({
+      rows: R,
+      cols: C,
+      cells,
+      period: String(P),
+      cycleMin: String(cmin),
+      cycleMax: String(cmax),
+      jumpCap: String(cap),
+      anchorRow: ar,
+      anchorCol: ac,
+      anchorCycles: String(anchorK),
+    });
+
+    it(`seed=${seed} ${R}x${C}：枚举恰好等于暴力的全部同分矩阵`, () => {
+      const expected = bruteSolve(p);
+      if (expected.length === 0) {
+        expect(solve(p).status).toBe('unsat');
+        return;
+      }
+      const best = expected[0];
+      // bruteSolve 已按 (o2, o1, 字典序) 排序，过滤后仍保持行优先字典序
+      const tiedExpected = expected
+        .filter((e) => e.o2 === best.o2 && e.o1 === best.o1)
+        .map((e) => e.cycles);
+      const got = enumerateTied(p, best.o2, best.o1);
+      expect(got.truncated).toBe(false);
+      expect(got.matrices).toEqual(tiedExpected);
+      // 首项必为 solve 给出的主见证
+      const solved = solve(p);
+      if (solved.status === 'ok') expect(got.matrices[0]).toEqual(solved.primary.cycles);
+    });
+  }
+
+  it('唯一最优时枚举结果恰为主见证本身', () => {
+    const p = paramsFrom({
+      cells: ['1', '1', '1', '1'],
+      period: '2',
+      cycleMin: '0',
+      cycleMax: '0',
+      jumpCap: '1',
+    });
+    const s = solve(p);
+    expect(s.status).toBe('ok');
+    if (s.status !== 'ok') return;
+    const got = enumerateTied(p, s.primary.objective2, s.primary.objective1);
+    expect(got.truncated).toBe(false);
+    expect(got.matrices).toEqual([[0, 0, 0, 0]]);
+  });
+
+  it('目标值对不可达时枚举为空', () => {
+    const p = paramsFrom({});
+    expect(enumerateTied(p, 999, 999).matrices).toEqual([]);
+  });
+});
+
+describe('evaluate 附带同分矩阵集合', () => {
+  it('并列时 tied 含主见证与全部替代矩阵', () => {
+    // 2x2 并列实例：[0,0,0,0] 与 [0,0,1,0] 同分
+    const e = evaluate(
+      baseRaw({
+        cells: ['3', '2', '1', '4'],
+        period: '5',
+        cycleMin: '0',
+        cycleMax: '1',
+        jumpCap: '1',
+      }),
+    );
+    expect(e.status).toBe('ok');
+    if (e.status !== 'ok') return;
+    expect(e.result.witness).not.toBeNull();
+    expect(e.tied.truncated).toBe(false);
+    expect(e.tied.matrices[0]).toEqual(e.result.primary.cycles);
+    expect(e.tied.matrices[1]).toEqual(e.result.witness!.cycles);
+    expect(e.tied.matrices.length).toBe(2);
+  });
+
+  it('唯一时 tied 仅含主见证', () => {
+    const e = evaluate(baseRaw());
+    expect(e.status).toBe('ok');
+    if (e.status !== 'ok') return;
+    expect(e.result.witness).toBeNull();
+    expect(e.tied.matrices).toEqual([e.result.primary.cycles]);
+  });
 });
 
 /* ---------------- 24x4 规模性能 ---------------- */

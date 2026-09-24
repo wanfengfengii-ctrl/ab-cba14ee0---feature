@@ -84,10 +84,21 @@ export type SolveResult =
       failCell: { row: number; col: number } | null;
     };
 
+/** 两项目标值并列的全部圈数矩阵（含主见证，行优先圈数字典序升序） */
+export interface TiedInfo {
+  matrices: number[][];
+  /** 替代矩阵数量超过枚举上限被截断（此时 matrices 不完整，不可用于补测规划） */
+  truncated: boolean;
+}
+
 export type Evaluation =
   | { status: 'invalid'; issues: Issue[] }
   | { status: 'unsat'; result: Extract<SolveResult, { status: 'unsat' }> }
-  | { status: 'ok'; result: Extract<SolveResult, { status: 'ok' }> };
+  | {
+      status: 'ok';
+      result: Extract<SolveResult, { status: 'ok' }>;
+      tied: TiedInfo;
+    };
 
 /** 严格解析十进制整数（允许前后空白与正负号），超界或非法返回 null */
 export function parseInteger(text: string): number | null {
@@ -325,12 +336,10 @@ function prune(recs: Rec[]): Rec[] {
   return kept;
 }
 
-export function solve(p: SolverParams): SolveResult {
-  const { rows: R, cols: C, readings: rd, period: P } = p;
-  const N = R * C;
-  const limit = p.jumpCap * P;
-  const anchorIndex = p.anchorRow * C + p.anchorCol;
-
+/** 每格可选圈数域：锚点格仅含锚定值，其余格为全局区间 */
+function buildDomain(p: SolverParams): number[][] {
+  const N = p.rows * p.cols;
+  const anchorIndex = p.anchorRow * p.cols + p.anchorCol;
   const domain: number[][] = new Array(N);
   for (let i = 0; i < N; i++) {
     domain[i] =
@@ -338,6 +347,119 @@ export function solve(p: SolverParams): SolveResult {
         ? [p.anchorCycles]
         : Array.from({ length: p.cycleMax - p.cycleMin + 1 }, (_, d) => p.cycleMin + d);
   }
+  return domain;
+}
+
+/**
+ * 前沿推进一格：对前沿中每个状态尝试该格全部可选圈数，
+ * 即时校验左、上两条相邻边并增量累计一阶/二阶差分，返回未剪枝的下一前沿。
+ */
+function expandCell(
+  frontier: Map<string, Node>,
+  p: SolverParams,
+  domain: number[][],
+  r: number,
+  c: number,
+): Map<string, Node> {
+  const { cols: C, readings: rd, period: P } = p;
+  const limit = p.jumpCap * P;
+  const i = r * C + c;
+  const next = new Map<string, Node>();
+
+  for (const node of frontier.values()) {
+    const leftK = c > 0 ? node.cur[c - 1] : null;
+    const upK = r > 0 ? node.ob[c] : null;
+    const tbK = r >= 2 ? node.tb[0] : null;
+
+    for (const k of domain[i]) {
+      let o2add = 0;
+      let o1add = 0;
+      let feasible = true;
+
+      if (leftK !== null) {
+        const dNew = rd[i] - rd[i - 1] + (k - leftK) * P;
+        if (Math.abs(dNew) > limit) {
+          feasible = false;
+        } else {
+          o1add += Math.abs(dNew);
+          if (c >= 2) {
+            const dPrev = rd[i - 1] - rd[i - 2] + (leftK - node.cur[c - 2]) * P;
+            o2add += Math.abs(dNew - dPrev);
+          }
+        }
+      }
+      if (feasible && upK !== null) {
+        const dNew = rd[i] - rd[i - C] + (k - upK) * P;
+        if (Math.abs(dNew) > limit) {
+          feasible = false;
+        } else {
+          o1add += Math.abs(dNew);
+          if (r >= 2) {
+            const dPrev = rd[i - C] - rd[i - 2 * C] + (upK - (tbK as number)) * P;
+            o2add += Math.abs(dNew - dPrev);
+          }
+        }
+      }
+      if (!feasible) continue;
+
+      let ntb: number[];
+      let nob: number[];
+      let ncur: number[];
+      if (c + 1 < C) {
+        ntb = r >= 2 ? node.tb.slice(1) : [];
+        nob = node.ob;
+        ncur = [...node.cur, k];
+      } else {
+        // 换行：上一行成为 tb（若下下行需要），当前行成为 ob
+        ntb = node.ob;
+        nob = [...node.cur, k];
+        ncur = [];
+      }
+
+      const key = nodeKey(ntb, nob, ncur);
+      let bucket = next.get(key);
+      if (!bucket) {
+        bucket = { tb: ntb, ob: nob, cur: ncur, recs: [] };
+        next.set(key, bucket);
+      }
+      for (const parent of node.recs) {
+        bucket.recs.push({
+          o2: parent.o2 + o2add,
+          o1: parent.o1 + o1add,
+          k,
+          parent,
+        });
+      }
+    }
+  }
+  return next;
+}
+
+/** 由记录链反向重建完整行优先圈数序列 */
+function rebuildCycles(rec: Rec, n: number): number[] {
+  const cycles = new Array<number>(n);
+  let cur: Rec | null = rec;
+  for (let i = n - 1; i >= 0; i--) {
+    cycles[i] = cur!.k;
+    cur = cur!.parent;
+  }
+  return cycles;
+}
+
+/** 行优先圈数序列字典序 */
+function compareCycles(a: number[], b: number[]): number {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+export function solve(p: SolverParams): SolveResult {
+  const { rows: R, cols: C, readings: rd, period: P } = p;
+  const N = R * C;
+  const limit = p.jumpCap * P;
+
+  const domain: number[][] = buildDomain(p);
 
   // 单边固有可行性预检：任一相邻对在各自圈数域内都无法满足跳变上限 → 定位该边
   const edgeFailures: EdgeFailure[] = [];
@@ -375,75 +497,7 @@ export function solve(p: SolverParams): SolveResult {
 
   for (let r = 0; r < R; r++) {
     for (let c = 0; c < C; c++) {
-      const i = r * C + c;
-      const next = new Map<string, Node>();
-
-      for (const node of frontier.values()) {
-        const leftK = c > 0 ? node.cur[c - 1] : null;
-        const upK = r > 0 ? node.ob[c] : null;
-        const tbK = r >= 2 ? node.tb[0] : null;
-
-        for (const k of domain[i]) {
-          let o2add = 0;
-          let o1add = 0;
-          let feasible = true;
-
-          if (leftK !== null) {
-            const dNew = rd[i] - rd[i - 1] + (k - leftK) * P;
-            if (Math.abs(dNew) > limit) {
-              feasible = false;
-            } else {
-              o1add += Math.abs(dNew);
-              if (c >= 2) {
-                const dPrev = rd[i - 1] - rd[i - 2] + (leftK - node.cur[c - 2]) * P;
-                o2add += Math.abs(dNew - dPrev);
-              }
-            }
-          }
-          if (feasible && upK !== null) {
-            const dNew = rd[i] - rd[i - C] + (k - upK) * P;
-            if (Math.abs(dNew) > limit) {
-              feasible = false;
-            } else {
-              o1add += Math.abs(dNew);
-              if (r >= 2) {
-                const dPrev = rd[i - C] - rd[i - 2 * C] + (upK - (tbK as number)) * P;
-                o2add += Math.abs(dNew - dPrev);
-              }
-            }
-          }
-          if (!feasible) continue;
-
-          let ntb: number[];
-          let nob: number[];
-          let ncur: number[];
-          if (c + 1 < C) {
-            ntb = r >= 2 ? node.tb.slice(1) : [];
-            nob = node.ob;
-            ncur = [...node.cur, k];
-          } else {
-            // 换行：上一行成为 tb（若下下行需要），当前行成为 ob
-            ntb = node.ob;
-            nob = [...node.cur, k];
-            ncur = [];
-          }
-
-          const key = nodeKey(ntb, nob, ncur);
-          let bucket = next.get(key);
-          if (!bucket) {
-            bucket = { tb: ntb, ob: nob, cur: ncur, recs: [] };
-            next.set(key, bucket);
-          }
-          for (const parent of node.recs) {
-            bucket.recs.push({
-              o2: parent.o2 + o2add,
-              o1: parent.o1 + o1add,
-              k,
-              parent,
-            });
-          }
-        }
-      }
+      const next = expandCell(frontier, p, domain, r, c);
 
       if (next.size === 0) {
         failCell = { row: r, col: c };
@@ -477,15 +531,7 @@ export function solve(p: SolverParams): SolveResult {
     (rec) => rec.o2 === best!.o2 && rec.o1 === best!.o1,
   );
 
-  const rebuild = (rec: Rec): number[] => {
-    const cycles = new Array<number>(N);
-    let cur: Rec | null = rec;
-    for (let i = N - 1; i >= 0; i--) {
-      cycles[i] = cur!.k;
-      cur = cur!.parent;
-    }
-    return cycles;
-  };
+  const rebuild = (rec: Rec): number[] => rebuildCycles(rec, N);
   const toSolution = (cycles: number[], rec: Rec): Solution => ({
     cycles,
     unwrapped: cycles.map((k, i) => rd[i] + k * P),
@@ -504,12 +550,7 @@ export function solve(p: SolverParams): SolveResult {
       opts.push({ cycles, rec });
     }
   }
-  opts.sort((a, b) => {
-    for (let i = 0; i < N; i++) {
-      if (a.cycles[i] !== b.cycles[i]) return a.cycles[i] - b.cycles[i];
-    }
-    return 0;
-  });
+  opts.sort((a, b) => compareCycles(a.cycles, b.cycles));
 
   return {
     status: 'ok',
@@ -518,12 +559,108 @@ export function solve(p: SolverParams): SolveResult {
   };
 }
 
-/** 页面与测试共用的总入口：校验 → 求解 */
+/* ---------------- 同分替代矩阵完整枚举（补测规划用） ---------------- */
+
+/** 枚举产物上限：替代矩阵最多保留条数 / 前沿记录总数上限（超出即截断并标记） */
+export const MAX_TIED_MATRICES = 4096;
+const MAX_ENUM_RECS = 120_000;
+
+/**
+ * 枚举全部达到给定目标值对 (targetO2, targetO1) 的可行圈数矩阵。
+ *
+ * 与 solve 共用同一前沿展开；剪枝规则保证不丢失任何同分最优序列：
+ *  - 一阶/二阶增量均非负，已超目标值的分组不可能回到目标，直接丢弃；
+ *  - 同状态下被严格劣势支配的分组，其任何后缀完成都被同一后缀的支配组严格优于，
+ *    不可能跻身最终并列，整体淘汰；
+ *  - 其余分组的全部前缀完整保留，终点收集目标值对上的所有序列并去重排序。
+ */
+export function enumerateTied(
+  p: SolverParams,
+  targetO2: number,
+  targetO1: number,
+): TiedInfo {
+  const { rows: R, cols: C } = p;
+  const N = R * C;
+  const domain = buildDomain(p);
+
+  const initial: Node = { tb: [], ob: [], cur: [], recs: [{ o2: 0, o1: 0, k: -1, parent: null }] };
+  let frontier = new Map<string, Node>([[nodeKey([], [], []), initial]]);
+
+  for (let r = 0; r < R; r++) {
+    for (let c = 0; c < C; c++) {
+      const next = expandCell(frontier, p, domain, r, c);
+      if (next.size === 0) return { matrices: [], truncated: false };
+
+      let total = 0;
+      for (const node of next.values()) {
+        node.recs = pruneTowardsTarget(node.recs, targetO2, targetO1);
+        total += node.recs.length;
+      }
+      if (total > MAX_ENUM_RECS) return { matrices: [], truncated: true };
+      frontier = next;
+    }
+  }
+
+  const seen = new Set<string>();
+  const matrices: number[][] = [];
+  for (const node of frontier.values()) {
+    for (const rec of node.recs) {
+      if (rec.o2 !== targetO2 || rec.o1 !== targetO1) continue;
+      const cycles = rebuildCycles(rec, N);
+      const key = cycles.join(',');
+      if (!seen.has(key)) {
+        seen.add(key);
+        matrices.push(cycles);
+      }
+    }
+  }
+  matrices.sort(compareCycles);
+
+  if (matrices.length > MAX_TIED_MATRICES) {
+    return { matrices: matrices.slice(0, MAX_TIED_MATRICES), truncated: true };
+  }
+  return { matrices, truncated: false };
+}
+
+/**
+ * 枚举专用剪枝：丢弃已超目标值的分组与同状态下的严格劣势分组，
+ * 其余分组的记录全部保留（不截断条数）。
+ */
+function pruneTowardsTarget(recs: Rec[], targetO2: number, targetO1: number): Rec[] {
+  const groups = new Map<string, Rec[]>();
+  for (const r of recs) {
+    if (r.o2 > targetO2 || r.o1 > targetO1) continue;
+    const key = r.o2 + '#' + r.o1;
+    const g = groups.get(key);
+    if (!g) groups.set(key, [r]);
+    else g.push(r);
+  }
+
+  const pairs: { o2: number; o1: number; recs: Rec[] }[] = [];
+  for (const g of groups.values()) pairs.push({ o2: g[0].o2, o1: g[0].o1, recs: g });
+
+  const kept: Rec[] = [];
+  for (const p of pairs) {
+    const dominated = pairs.some(
+      (q) =>
+        q !== p &&
+        q.o2 <= p.o2 &&
+        q.o1 <= p.o1 &&
+        (q.o2 < p.o2 || q.o1 < p.o1),
+    );
+    if (!dominated) kept.push(...p.recs);
+  }
+  return kept;
+}
+
+/** 页面与测试共用的总入口：校验 → 求解（→ 并列时枚举全部同分矩阵） */
 export function evaluate(raw: RawInputs): Evaluation {
   const checked = validate(raw);
   if ('issues' in checked) return { status: 'invalid', issues: checked.issues };
   const result = solve(checked.params);
-  return result.status === 'ok'
-    ? { status: 'ok', result }
-    : { status: 'unsat', result };
+  if (result.status !== 'ok') return { status: 'unsat', result };
+  const tied = result.witness
+    ? enumerateTied(checked.params, result.primary.objective2, result.primary.objective1)
+    : { matrices: [result.primary.cycles.slice()], truncated: false };
+  return { status: 'ok', result, tied };
 }
